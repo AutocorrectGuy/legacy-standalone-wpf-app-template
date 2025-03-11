@@ -1,80 +1,173 @@
-function ConcatinateAllCodeFiles([string] $scriptsFolderPath) {
-    $regex = New-Object System.Text.RegularExpressions.Regex '(?:\s?using[\s]+)([\w\.]+)(?:;)'
-    $headers = New-Object System.Collections.ArrayList
-    $body = New-Object System.Collections.ArrayList
-    ls $scriptsFolderPath -Recurse -Filter "*.cs" `
-        | % { CollectHeadersAndBody -path $_.FullName -regex $regex -headers $headers -body $body }
+# Run the application in development mode (in-memory execution):
+# ```ps1
+#   powershell -ep Bypass -File ./index.ps1
+# ```
 
-    [System.Text.StringBuilder] $sb = New-Object System.Text.StringBuilder
+# Run the application in build mode (as .exe file):
+# ```ps1
+#   powershell -ep Bypass -c { & "./index.ps1" -buildExe $true }
+# ```
 
-    if ($headers.Count -ne 0) {
-        $sb.Append('using ') | Out-Null
-        $sb.Append($headers[0]) | Out-Null
+# Alternatively, set $buildExe = $true below:
+Param(
+    [bool] $buildExe = $false
+)   
 
-        for ([int] $i = 1; $i -lt $headers.Count; $i++) {
-            $sb.Append(";`nusing ") | Out-Null
-            $sb.Append($headers[$i]) | Out-Null
-        }
-        
-        $sb.Append(";`n`n") | Out-Null
+Set-StrictMode -Version Latest
+
+[string] $ASSEMBLY_PATH = "./CustomWPFApp.dll"
+[string] $EXECUTABLE_PATH = "./MyApp.exe"
+[string] $SOURCE_CODE_PATH = "./CustomWPFApp"
+
+function ConcatinateCodeFiles([string] $codeFilesPath)
+{
+    [string[]] $filePaths = Get-ChildItem `
+        -Path $codeFilesPath `
+        -Filter "*.cs" `
+        -Recurse `
+    | ForEach-Object { $_.FullName }
+    
+    [System.Collections.ArrayList] $headers = New-Object System.Collections.ArrayList
+    [System.Text.StringBuilder] $body = New-Object System.Text.StringBuilder
+
+    foreach ($filePath in $filePaths)
+    {
+        CollectHeadersAndBody `
+            -filePath $filePath `
+            -headers $headers `
+            -body $body
     }
 
-    foreach ($bodyLine in $body) {
-        $sb.AppendLine($bodyLine) | Out-Null
+    [System.Text.StringBuilder] $resultCode = New-Object System.Text.StringBuilder
+    foreach ($header in $headers)
+    {
+        [void] $resultCode.Append("using ").Append($header).AppendLine(";")
     }
 
-    return ($sb.ToString())
+    [void] $resultCode.AppendLine()
+    [void] $resultCode.Append($body.ToString())
+    return $resultCode.ToString()
 }
 
 function CollectHeadersAndBody(
-    [string] $path, 
-    [System.Text.RegularExpressions.Regex] $regex, 
+    [string] $filePath, 
     [System.Collections.ArrayList] $headers, 
-    [System.Collections.ArrayList] $body
-) {    
-    $lines = Get-Content -Path $path
-    [int] $lastHeaderLine = 0
-    
-    for ([int] $i = 0; $i -lt $lines.Count; $i++) {
-        $match = $regex.Match($lines[$i])
-        
-        if (-not $match.Success) {
-            $lastHeaderLine = $i
-            break
-        }
-        
-        if ($headers.Contains($match.Groups[1].Value)) {
-            continue
-        }
+    [System.Text.StringBuilder] $body
+)
+{
+    [string[]] $lines = Get-Content -Path $filePath
+    [int] $firstBodyLineIndex = 0
 
-        $headers.Add($match.Groups[1].Value) | Out-Null
-    }
-    
-    for ([int] $i = $lastHeaderLine; $i -lt $lines.Count; $i++) {
-        if ($lines[$i].Length -ne 0) {
-            $body.Add($lines[$i]) | Out-Null
+    for ([int] $i = 0; $i -lt $lines.Count; $i++)
+    {
+        $line = $lines[$i]
+        $matched = [System.Text.RegularExpressions.Regex]::Matches($line, "(?:\s*using\s)([\w\.]+)(?:\s*;\s*)")
+
+        if ($matched.Count -eq 0)
+        {
+            $firstBodyLineIndex = $i
+            break;
         }
+        
+        foreach ($match in $matched)
+        {
+            if (-not $match.Success) { continue; }
+            $capturedHeader = $match.Groups[1]
+            if ($null -eq $capturedHeader) { continue; }
+            if ($headers.Contains($capturedHeader.Value)) { continue; }
+            [void] $headers.Add($capturedHeader.Value)
+        }
+    }
+
+    for ([int] $i = $firstBodyLineIndex; $i -lt $lines.Count; $i++)
+    {
+        [void] $body.AppendLine($lines[$i])
     }
 }
 
-function GenerateAssembly([string] $scriptsFolderPath) {
-    try {
+function CompileToAssembly([string] $outputAssemblyName, [string] $sourceCode)
+{   
+    try
+    {
         Add-Type `
-            -TypeDefinition (ConcatinateAllCodeFiles -scriptsFolderPath "./scripts") `
+            -TypeDefinition $sourceCode `
             -ErrorAction Stop `
-            -ReferencedAssemblies WindowsBase, PresentationFramework, PresentationCore, System.Xaml
-        Write-Host `
-            -Object "Assembly compiled successfully" `
-            -Background Green `
-            -Foreground White
-    } 
-    catch {
-        Write-Host `
-            -Object "Failed to compile assembly, reason`n$($_.Exception.Message)" `
-            -Background Red `
-            -Foreground Yellow 
+            -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase, System.Xaml `
+            -OutputAssembly $outputAssemblyName
+    }
+    catch
+    {
+        Write-Host "Failed to compile assembly, reason:`n$($_.Exception.Message)"
     }
 }
 
-GenerateAssembly -scriptsFolderPath "./scripts"
-[Program]::Main()
+function GenerateExecutable(
+    [string] $assemblyPath, 
+    [string] $executableName, 
+    [bool] $buildExecutable
+)
+{
+    [System.Collections.Hashtable] $buildArguments = @{}
+    if ($buildExecutable)
+    {
+        $buildArguments["OutputAssembly"] = $executableName
+        $buildArguments["OutputType"] = "WindowsApplication"
+    }
+
+    try
+    {
+        Add-Type -Path $assemblyPath
+        Add-Type -TypeDefinition @"
+        using System;
+            public class Program {
+                    [STAThread]
+                    public static void Main()
+                    {
+                        CustomWPFApp.App app = new CustomWPFApp.App();
+                        app.Start();
+                    }
+                }
+"@ `
+            -ReferencedAssemblies `
+        (Resolve-Path $assemblyPath), `
+            PresentationCore, `
+            PresentationFramework, `
+            WindowsBase, `
+            System.Xaml `
+            @buildArguments
+    }
+    catch
+    {
+        Write-Host "Failed to compile executable, reason:`n$($_.Exception.Message)"
+    }
+}
+
+function StartProgram([bool] $runExecutable)
+{
+    if ($runExecutable -eq $true)
+    {
+        Write-Host "Running executeble..."w
+        # runs the compiled executable
+        Start-Process $EXECUTABLE_PATH
+    }
+    else
+    {
+        Write-Host "Running in-memmory assembly"
+        # runs the compiled in-memory assembly
+        [Program]::Main()
+    }
+}
+
+$sourceCode = ConcatinateCodeFiles -codeFilesPath $SOURCE_CODE_PATH
+
+CompileToAssembly `
+    -outputAssemblyName $ASSEMBLY_PATH `
+    -sourceCode $sourceCode
+
+GenerateExecutable `
+    -assemblyPath $ASSEMBLY_PATH `
+    -executableName $EXECUTABLE_PATH `
+    -buildExecutable $buildExe
+
+StartProgram `
+    -runExecutable $buildExe
